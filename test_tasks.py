@@ -3,25 +3,22 @@ from unittest.mock import patch, MagicMock, AsyncMock
 from botocore.exceptions import ClientError
 import io
 
-from tasks import (
-    get_s3_client,
+from tasks import parse_page, get_book_location_events
+from services.s3 import get_s3_client, download_book_from_s3
+from services.pdf import extract_pages_from_pdf
+from services.yandex_gpt import extract_events_from_text
+from services.events import send_events_to_endpoint
+from config import (
     get_bucket_name,
-    download_book_from_s3,
-    extract_pages_from_pdf,
-    parse_page,
-    get_book_location_events,
     get_yandex_api_key,
     get_yandex_folder_id,
-    get_events_endpoint,
-    extract_events_from_text,
-    send_events_to_endpoint,
 )
 
 
 class TestGetS3Client:
     def test_returns_boto3_client(self):
         """Test that get_s3_client returns a boto3 S3 client."""
-        with patch("tasks.boto3.client") as mock_client:
+        with patch("services.s3.boto3.client") as mock_client:
             mock_client.return_value = MagicMock()
             client = get_s3_client()
             mock_client.assert_called_once_with("s3")
@@ -50,8 +47,8 @@ class TestDownloadBookFromS3:
         mock_s3_client = MagicMock()
         mock_s3_client.get_object.return_value = {"Body": mock_body}
 
-        with patch("tasks.get_s3_client", return_value=mock_s3_client):
-            with patch("tasks.get_bucket_name", return_value="test-bucket"):
+        with patch("services.s3.get_s3_client", return_value=mock_s3_client):
+            with patch("services.s3.get_bucket_name", return_value="test-bucket"):
                 content = download_book_from_s3("books/test.pdf")
 
                 assert content == b"fake pdf content"
@@ -68,8 +65,8 @@ class TestDownloadBookFromS3:
             "GetObject"
         )
 
-        with patch("tasks.get_s3_client", return_value=mock_s3_client):
-            with patch("tasks.get_bucket_name", return_value="test-bucket"):
+        with patch("services.s3.get_s3_client", return_value=mock_s3_client):
+            with patch("services.s3.get_bucket_name", return_value="test-bucket"):
                 with pytest.raises(ClientError):
                     download_book_from_s3("nonexistent/file.pdf")
 
@@ -89,7 +86,7 @@ class TestExtractPagesFromPdf:
         mock_reader = MagicMock()
         mock_reader.pages = [mock_page1, mock_page2, mock_page3]
 
-        with patch("tasks.PdfReader", return_value=mock_reader):
+        with patch("services.pdf.PdfReader", return_value=mock_reader):
             pages = extract_pages_from_pdf(b"fake pdf bytes")
 
             assert len(pages) == 3
@@ -98,25 +95,27 @@ class TestExtractPagesFromPdf:
             assert pages[2] == "Page 3 content"
 
     def test_handles_empty_pages(self):
-        """Test that empty pages return empty strings."""
+        """Test that empty pages trigger OCR."""
         mock_page = MagicMock()
         mock_page.extract_text.return_value = None
 
         mock_reader = MagicMock()
         mock_reader.pages = [mock_page]
 
-        with patch("tasks.PdfReader", return_value=mock_reader):
-            pages = extract_pages_from_pdf(b"fake pdf bytes")
+        with patch("services.pdf.PdfReader", return_value=mock_reader):
+            with patch("services.pdf.convert_from_bytes", return_value=[]) as mock_convert:
+                pages = extract_pages_from_pdf(b"fake pdf bytes")
 
-            assert len(pages) == 1
-            assert pages[0] == ""
+                assert len(pages) == 1
+                assert pages[0] == ""
+                mock_convert.assert_called_once()
 
     def test_handles_empty_pdf(self):
         """Test that PDFs with no pages return empty list."""
         mock_reader = MagicMock()
         mock_reader.pages = []
 
-        with patch("tasks.PdfReader", return_value=mock_reader):
+        with patch("services.pdf.PdfReader", return_value=mock_reader):
             pages = extract_pages_from_pdf(b"fake pdf bytes")
 
             assert pages == []
@@ -133,8 +132,9 @@ class TestParsePage:
                 result = await parse_page(
                     page_number=1,
                     page_text="This is test content for page 1",
-                    s3_key="books/test.pdf",
-                    user_id="user123",
+                    blob_key="books/test.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
                     language="en"
                 )
 
@@ -152,8 +152,9 @@ class TestParsePage:
                 result = await parse_page(
                     page_number=5,
                     page_text="Inhalt auf Deutsch",
-                    s3_key="books/german.pdf",
-                    user_id="user456",
+                    blob_key="books/german.pdf",
+                    book_id=456,
+                    callback_url="http://example.com/books/456/events",
                     language="de"
                 )
 
@@ -167,8 +168,9 @@ class TestParsePage:
         result = await parse_page(
             page_number=10,
             page_text="",
-            s3_key="books/test.pdf",
-            user_id="user123",
+            blob_key="books/test.pdf",
+            book_id=123,
+            callback_url="http://example.com/books/123/events",
             language="en"
         )
 
@@ -194,8 +196,9 @@ class TestGetBookLocationEvents:
                     ]
 
                     results = await get_book_location_events(
-                        s3_key="books/test.pdf",
-                        user_id="user123",
+                        blob_key="books/test.pdf",
+                        book_id=123,
+                        callback_url="http://example.com/books/123/events",
                         language="en"
                     )
 
@@ -203,7 +206,7 @@ class TestGetBookLocationEvents:
                     mock_download.assert_called_once_with("books/test.pdf")
 
                     # Verify PDF extraction
-                    mock_extract.assert_called_once_with(mock_pdf_content)
+                    mock_extract.assert_called_once_with(mock_pdf_content, "en")
 
                     # Verify parse_page was called for each page
                     assert mock_parse.call_count == 3
@@ -223,8 +226,9 @@ class TestGetBookLocationEvents:
                     mock_parse.return_value = {"page_number": 1, "status": "completed", "char_count": 12, "events_count": 0, "events": []}
 
                     await get_book_location_events(
-                        s3_key="books/french.pdf",
-                        user_id="user789",
+                        blob_key="books/french.pdf",
+                        book_id=789,
+                        callback_url="http://example.com/books/789/events",
                         language="fr"
                     )
 
@@ -232,8 +236,9 @@ class TestGetBookLocationEvents:
                     mock_parse.assert_called_once_with(
                         page_number=1,
                         page_text="Page content",
-                        s3_key="books/french.pdf",
-                        user_id="user789",
+                        blob_key="books/french.pdf",
+                        book_id=789,
+                        callback_url="http://example.com/books/789/events",
                         language="fr"
                     )
 
@@ -246,8 +251,9 @@ class TestGetBookLocationEvents:
                     mock_parse.return_value = {"page_number": 1, "status": "completed", "char_count": 7, "events_count": 0, "events": []}
 
                     await get_book_location_events(
-                        s3_key="books/test.pdf",
-                        user_id="user123"
+                        blob_key="books/test.pdf",
+                        book_id=123,
+                        callback_url="http://example.com/books/123/events"
                     )
 
                     # Verify default language "en" was used
@@ -265,8 +271,9 @@ class TestGetBookLocationEvents:
 
             with pytest.raises(ClientError):
                 await get_book_location_events(
-                    s3_key="nonexistent/file.pdf",
-                    user_id="user123",
+                    blob_key="nonexistent/file.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
                     language="en"
                 )
 
@@ -276,8 +283,9 @@ class TestGetBookLocationEvents:
         with patch("tasks.download_book_from_s3", return_value=b"empty pdf"):
             with patch("tasks.extract_pages_from_pdf", return_value=[]):
                 results = await get_book_location_events(
-                    s3_key="books/empty.pdf",
-                    user_id="user123",
+                    blob_key="books/empty.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
                     language="en"
                 )
 
@@ -293,8 +301,9 @@ class TestGetBookLocationEvents:
 
                     with pytest.raises(Exception, match="Processing failed"):
                         await get_book_location_events(
-                            s3_key="books/test.pdf",
-                            user_id="user123",
+                            blob_key="books/test.pdf",
+                            book_id=123,
+                            callback_url="http://example.com/books/123/events",
                             language="en"
                         )
 
@@ -324,18 +333,6 @@ class TestYandexGPTConfiguration:
             folder_id = get_yandex_folder_id()
             assert folder_id == ""
 
-    def test_get_events_endpoint_from_env(self):
-        """Test that get_events_endpoint returns value from environment."""
-        with patch.dict("os.environ", {"EVENTS_ENDPOINT": "https://example.com/books/events"}):
-            endpoint = get_events_endpoint()
-            assert endpoint == "https://example.com/books/events"
-
-    def test_get_events_endpoint_default(self):
-        """Test that get_events_endpoint returns empty string by default."""
-        with patch.dict("os.environ", {}, clear=True):
-            endpoint = get_events_endpoint()
-            assert endpoint == ""
-
 
 class TestExtractEventsFromText:
     @pytest.mark.asyncio
@@ -355,7 +352,7 @@ class TestExtractEventsFromText:
         }
 
         with patch.dict("os.environ", {"YANDEX_API_KEY": "test-key", "YANDEX_FOLDER_ID": "test-folder"}):
-            with patch("tasks.httpx.AsyncClient") as mock_client:
+            with patch("services.yandex_gpt.httpx.AsyncClient") as mock_client:
                 mock_context = MagicMock()
                 mock_context.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
                 mock_client.return_value = mock_context
@@ -391,7 +388,7 @@ class TestExtractEventsFromText:
         }
 
         with patch.dict("os.environ", {"YANDEX_API_KEY": "test-key", "YANDEX_FOLDER_ID": "test-folder"}):
-            with patch("tasks.httpx.AsyncClient") as mock_client:
+            with patch("services.yandex_gpt.httpx.AsyncClient") as mock_client:
                 mock_context = MagicMock()
                 mock_context.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
                 mock_client.return_value = mock_context
@@ -417,7 +414,7 @@ class TestExtractEventsFromText:
         }
 
         with patch.dict("os.environ", {"YANDEX_API_KEY": "test-key", "YANDEX_FOLDER_ID": "test-folder"}):
-            with patch("tasks.httpx.AsyncClient") as mock_client:
+            with patch("services.yandex_gpt.httpx.AsyncClient") as mock_client:
                 mock_context = MagicMock()
                 mock_context.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
                 mock_client.return_value = mock_context
@@ -437,36 +434,33 @@ class TestSendEventsToEndpoint:
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock()
 
-        with patch.dict("os.environ", {"EVENTS_ENDPOINT": "https://example.com/books/events"}):
-            with patch("tasks.httpx.AsyncClient") as mock_client:
-                mock_context = MagicMock()
-                mock_context.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
-                mock_client.return_value = mock_context
+        with patch("services.events.httpx.AsyncClient") as mock_client:
+            mock_context = MagicMock()
+            mock_context.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
+            mock_client.return_value = mock_context
 
-                await send_events_to_endpoint(events, "user123", "books/test.pdf", 1)
+            await send_events_to_endpoint(events, 123, "books/test.pdf", 1, "https://example.com/books/123/events")
 
-                # Verify post was called
-                mock_context.__aenter__.return_value.post.assert_called_once()
+            # Verify post was called
+            mock_context.__aenter__.return_value.post.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_send_events_no_endpoint_configured(self):
-        """Test that function returns early when endpoint not configured."""
+    async def test_send_events_no_callback_url(self):
+        """Test that function returns early when callback_url not provided."""
         events = [{"name": "Test Event", "date": "2020-01-01", "geo": "Test Location"}]
 
-        with patch.dict("os.environ", {}, clear=True):
-            # Should not raise an error
-            await send_events_to_endpoint(events, "user123", "books/test.pdf", 1)
+        # Should not raise an error
+        await send_events_to_endpoint(events, 123, "books/test.pdf", 1, "")
 
     @pytest.mark.asyncio
     async def test_send_events_empty_events_list(self):
         """Test that function returns early when events list is empty."""
-        with patch.dict("os.environ", {"EVENTS_ENDPOINT": "https://example.com/books/events"}):
-            with patch("tasks.httpx.AsyncClient") as mock_client:
-                # Should not make HTTP call
-                await send_events_to_endpoint([], "user123", "books/test.pdf", 1)
+        with patch("services.events.httpx.AsyncClient") as mock_client:
+            # Should not make HTTP call
+            await send_events_to_endpoint([], 123, "books/test.pdf", 1, "https://example.com/books/123/events")
 
-                # Verify post was never called
-                mock_client.return_value.__aenter__.return_value.post.assert_not_called()
+            # Verify post was never called
+            mock_client.return_value.__aenter__.return_value.post.assert_not_called()
 
 
 class TestParsePageWithYandexGPT:
@@ -482,8 +476,9 @@ class TestParsePageWithYandexGPT:
                 result = await parse_page(
                     page_number=1,
                     page_text="Some historical content with events",
-                    s3_key="books/test.pdf",
-                    user_id="user123",
+                    blob_key="books/test.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
                     language="en"
                 )
 
@@ -493,7 +488,7 @@ class TestParsePageWithYandexGPT:
                 assert result["events"] == mock_events
 
                 mock_extract.assert_called_once_with("Some historical content with events", "en")
-                mock_send.assert_called_once_with(mock_events, "user123", "books/test.pdf", 1)
+                mock_send.assert_called_once_with(mock_events, 123, "books/test.pdf", 1, "http://example.com/books/123/events")
 
     @pytest.mark.asyncio
     async def test_parse_page_skips_empty_text(self):
@@ -501,8 +496,9 @@ class TestParsePageWithYandexGPT:
         result = await parse_page(
             page_number=5,
             page_text="   ",
-            s3_key="books/test.pdf",
-            user_id="user123",
+            blob_key="books/test.pdf",
+            book_id=123,
+            callback_url="http://example.com/books/123/events",
             language="en"
         )
 
@@ -520,8 +516,9 @@ class TestParsePageWithYandexGPT:
                 result = await parse_page(
                     page_number=2,
                     page_text="Some content without events",
-                    s3_key="books/test.pdf",
-                    user_id="user123",
+                    blob_key="books/test.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
                     language="en"
                 )
 

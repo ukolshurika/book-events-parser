@@ -7,8 +7,12 @@ logger = logging.getLogger(__name__)
 
 
 def get_s3_client():
-    """Returns a boto3 S3 client."""
-    return boto3.client("s3")
+    """Returns a boto3 S3 client configured for Yandex Cloud Object Storage."""
+    return boto3.client(
+        "s3",
+        endpoint_url="https://storage.yandexcloud.net",
+        region_name="ru-central1",
+    )
 
 
 def download_book_from_s3(s3_key: str) -> bytes:
