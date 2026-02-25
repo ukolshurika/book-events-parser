@@ -26,7 +26,9 @@ TESSERACT_LANG_MAP = {
 
 
 def get_tesseract_lang(language: str) -> str:
-    """Converts ISO 639-1 language code to Tesseract language code."""
+    """Converts ISO 639-1 or Tesseract language code to Tesseract language code."""
+    if language in TESSERACT_LANG_MAP.values():
+        return language
     return TESSERACT_LANG_MAP.get(language, "eng")
 
 
