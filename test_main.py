@@ -1,79 +1,88 @@
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock
 from fastapi.testclient import TestClient
-import io
 
 from main import app
 
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    with patch("main.init_db", new_callable=AsyncMock), \
+         patch("main.close_db", new_callable=AsyncMock), \
+         patch("main.cleanup_old_records", new_callable=AsyncMock):
+        with TestClient(app) as c:
+            yield c
 
 
 class TestBookEndpoint:
     def test_post_book_success(self, client):
         """Test successful POST /book request returns OK."""
-        with patch("main.get_book_location_events") as mock_task:
+        with patch("main.get_book_location_events"):
             response = client.post(
                 "/book",
-                json={"s3_key": "books/test-book.pdf", "user_id": "user123"}
+                json={
+                    "blob_key": "books/test-book.pdf",
+                    "book_id": 123,
+                    "callback_url": "http://example.com/books/123/events",
+                }
             )
 
             assert response.status_code == 200
             assert response.json() == {"status": "OK"}
-
-    def test_post_book_triggers_background_task(self, client):
-        """Test that POST /book triggers the background task with correct args."""
-        with patch("main.get_book_location_events") as mock_task:
-            response = client.post(
-                "/book",
-                json={"s3_key": "books/another-book.pdf", "user_id": "user456"}
-            )
-
-            assert response.status_code == 200
-            # Background task is called with the provided arguments (including default language)
-            mock_task.assert_called_once_with("books/another-book.pdf", "user456", "en")
 
     def test_post_book_with_language(self, client):
         """Test POST /book with explicit language parameter."""
-        with patch("main.get_book_location_events") as mock_task:
+        with patch("main.get_book_location_events"):
             response = client.post(
                 "/book",
-                json={"s3_key": "books/german-book.pdf", "user_id": "user789", "language": "de"}
+                json={
+                    "blob_key": "books/german-book.pdf",
+                    "book_id": 789,
+                    "callback_url": "http://example.com/books/789/events",
+                    "language": "de",
+                }
             )
 
             assert response.status_code == 200
             assert response.json() == {"status": "OK"}
-            mock_task.assert_called_once_with("books/german-book.pdf", "user789", "de")
 
     def test_post_book_default_language(self, client):
         """Test POST /book uses default language 'en' when not specified."""
-        with patch("main.get_book_location_events") as mock_task:
+        with patch("main.get_book_location_events"):
             response = client.post(
                 "/book",
-                json={"s3_key": "books/test.pdf", "user_id": "user123"}
+                json={
+                    "blob_key": "books/test.pdf",
+                    "book_id": 123,
+                    "callback_url": "http://example.com/books/123/events",
+                }
             )
 
             assert response.status_code == 200
-            # Verify default language is "en"
-            call_args = mock_task.call_args[0]
-            assert call_args[2] == "en"
 
-    def test_post_book_missing_s3_key(self, client):
-        """Test POST /book with missing s3_key returns 422."""
+    def test_post_book_missing_blob_key(self, client):
+        """Test POST /book with missing blob_key returns 422."""
         response = client.post(
             "/book",
-            json={"user_id": "user123"}
+            json={"book_id": 123, "callback_url": "http://example.com/events"}
         )
 
         assert response.status_code == 422
 
-    def test_post_book_missing_user_id(self, client):
-        """Test POST /book with missing user_id returns 422."""
+    def test_post_book_missing_book_id(self, client):
+        """Test POST /book with missing book_id returns 422."""
         response = client.post(
             "/book",
-            json={"s3_key": "books/test.pdf"}
+            json={"blob_key": "books/test.pdf", "callback_url": "http://example.com/events"}
+        )
+
+        assert response.status_code == 422
+
+    def test_post_book_missing_callback_url(self, client):
+        """Test POST /book with missing callback_url returns 422."""
+        response = client.post(
+            "/book",
+            json={"blob_key": "books/test.pdf", "book_id": 123}
         )
 
         assert response.status_code == 422

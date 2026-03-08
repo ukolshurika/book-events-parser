@@ -11,9 +11,18 @@ logger = logging.getLogger(__name__)
 _pool: asyncpg.Pool | None = None
 
 
+async def _init_connection(conn):
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+
+
 async def init_db():
     global _pool
-    _pool = await asyncpg.create_pool(get_database_url())
+    _pool = await asyncpg.create_pool(get_database_url(), init=_init_connection)
     logger.info("Database pool initialized")
 
 

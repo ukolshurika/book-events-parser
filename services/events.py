@@ -29,11 +29,20 @@ async def send_events_to_endpoint(events: list[dict], book_id: int, blob_key: st
         logger.info(f"No events to send for page {page_number}")
         return
 
+    mapped_events = [
+        {
+            "title": event.get("name", ""),
+            "description": event.get("geo") or "",
+            "date": event.get("date"),
+        }
+        for event in events
+    ]
+
     payload = {
         "book_id": book_id,
         "blob_key": blob_key,
         "page_number": page_number,
-        "events": events
+        "events": mapped_events,
     }
     logger.info(f"Sending to {callback_url} payload: {payload}")
 
