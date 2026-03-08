@@ -1,6 +1,11 @@
+import hashlib
+import hmac
+import json
 import logging
 
 import httpx
+
+from config import get_callback_secret
 
 logger = logging.getLogger(__name__)
 
@@ -24,18 +29,32 @@ async def send_events_to_endpoint(events: list[dict], book_id: int, blob_key: st
         logger.info(f"No events to send for page {page_number}")
         return
 
+    payload = {
+        "book_id": book_id,
+        "blob_key": blob_key,
+        "page_number": page_number,
+        "events": events
+    }
+    logger.info(f"Sending to {callback_url} payload: {payload}")
+
+    body = json.dumps(payload, separators=(",", ":"))
+    signature = hmac.new(
+        get_callback_secret().encode(),
+        body.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 callback_url,
-                json={
-                    "book_id": book_id,
-                    "blob_key": blob_key,
-                    "page_number": page_number,
-                    "events": events
-                },
-                headers={"Content-Type": "application/json"}
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Signature": signature,
+                }
             )
+            logger.info(f"Callback response status: {response.status_code}, body: {response.text[:500]}")
             response.raise_for_status()
             logger.info(f"Successfully sent {len(events)} events to {callback_url} for page {page_number}")
 

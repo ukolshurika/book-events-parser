@@ -1,7 +1,10 @@
+import asyncio
 import logging
+from functools import partial
 
 from botocore.exceptions import ClientError
 
+from db import get_page_cache, save_page_text, save_page_events, mark_page_sent
 from services import (
     download_book_from_s3,
     extract_pages_from_pdf,
@@ -30,6 +33,17 @@ async def parse_page(page_number: int, page_text: str, blob_key: str, book_id: i
     try:
         logger.info(f"ParsePage: Page {page_number} has {len(page_text)} characters")
 
+        cache = await get_page_cache(blob_key, page_number)
+
+        # Already successfully sent — skip entirely
+        if cache and cache["status"] == "sent":
+            logger.info(f"ParsePage: Page {page_number} already sent, skipping")
+            return {
+                "page_number": page_number,
+                "status": "cached_sent",
+                "events_count": len(cache["events"] or []),
+            }
+
         # Skip processing if page is empty or too short
         if not page_text or len(page_text.strip()) < 10:
             logger.info(f"ParsePage: Skipping page {page_number} - insufficient text")
@@ -40,12 +54,23 @@ async def parse_page(page_number: int, page_text: str, blob_key: str, book_id: i
                 "events_count": 0
             }
 
-        # Extract events from page text using YandexGPT
-        events = await extract_events_from_text(page_text, language)
+        # Persist page text so it survives restarts
+        if not cache:
+            await save_page_text(blob_key, page_number, book_id, page_text)
+
+        # Use cached events if YandexGPT already ran for this page
+        if cache and cache["status"] == "events_ready" and cache["events"] is not None:
+            events = cache["events"]
+            logger.info(f"ParsePage: Using cached events for page {page_number}")
+        else:
+            events = await extract_events_from_text(page_text, language)
+            await save_page_events(blob_key, page_number, events)
 
         # Send events to callback endpoint
         if events:
             await send_events_to_endpoint(events, book_id, blob_key, page_number, callback_url)
+
+        await mark_page_sent(blob_key, page_number)
 
         logger.info(f"ParsePage: Completed processing page {page_number}, found {len(events)} events")
 
@@ -80,22 +105,28 @@ async def get_book_location_events(blob_key: str, book_id: int, callback_url: st
         file_content = download_book_from_s3(blob_key)
 
         # Step 2: Divide book into pages (with OCR support for image-based PDFs)
-        pages = extract_pages_from_pdf(file_content, language)
+        # Run in thread pool to avoid blocking the async event loop during OCR
+        loop = asyncio.get_event_loop()
+        pages = await loop.run_in_executor(None, partial(extract_pages_from_pdf, file_content, language))
 
         logger.info(f"Processing {len(pages)} pages for blob_key={blob_key}")
 
         # Step 3: Process each page with ParsePage worker
         results = []
         for page_number, page_text in enumerate(pages, start=1):
-            result = await parse_page(
-                page_number=page_number,
-                page_text=page_text,
-                blob_key=blob_key,
-                book_id=book_id,
-                callback_url=callback_url,
-                language=language
-            )
-            results.append(result)
+            try:
+                result = await parse_page(
+                    page_number=page_number,
+                    page_text=page_text,
+                    blob_key=blob_key,
+                    book_id=book_id,
+                    callback_url=callback_url,
+                    language=language
+                )
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Skipping page {page_number} after error: {e}")
+                results.append({"page_number": page_number, "status": "failed", "error": str(e)})
 
         logger.info(f"Completed 'Get Book Location Events' for book_id={book_id}, processed {len(results)} pages")
 

@@ -37,4 +37,4 @@ COPY . /app
 EXPOSE 8001
 
 # Run the application with Uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["sh", "-c", "yoyo apply --batch --database $DATABASE_URL ./migrations && uvicorn main:app --host 0.0.0.0 --port 8001"]

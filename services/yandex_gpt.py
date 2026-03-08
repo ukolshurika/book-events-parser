@@ -28,18 +28,18 @@ async def extract_events_from_text(page_text: str, language: str) -> list[dict]:
 
     url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
-    prompt = f"""Extract all historical events from the following text. Use only facts from the text. Be straight and precise.
-For each event, identify:
-- Event name
-- Event date (if available)
-- Event location/geo (if available, otherwise null)
+    prompt = f"""Извлеки все исторические события из следующего текста. Используй только факты из текста. Будь точен и краток.
+Для каждого события определи:
+- Название события
+- Дату события (если указана)
+- Место события/географию (если указано, иначе null)
 
-Return ONLY a JSON array with this exact structure:
-[{{"name": "Event name", "date": "Event date", "geo": "Event location"}}, {{"name": "Second event", "date": "Event2 date", "geo": null}}]
+Верни ТОЛЬКО JSON-массив следующей структуры:
+[{{"name": "Название события", "date": "Дата события", "geo": "Место события"}}, {{"name": "Второе событие", "date": "Дата второго события", "geo": null}}]
 
-If no events are found, return an empty array: []
+Если события не найдены, верни пустой массив: []
 
-Text to analyze:
+Текст для анализа:
 {page_text}"""
 
     headers = {
@@ -63,7 +63,7 @@ Text to analyze:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(url, headers=headers, json=payload)
             response.raise_for_status()
 
