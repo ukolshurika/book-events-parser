@@ -14,6 +14,80 @@ from services import (
 
 logger = logging.getLogger(__name__)
 
+BATCH_SIZE = 10
+
+
+async def parse_batch(batch_start: int, pages: list[tuple[int, str]], blob_key: str, book_id: int, callback_url: str, language: str):
+    """
+    Worker task that processes a batch of pages with a single YandexGPT call.
+    Extracts events using YandexGPT and sends them to the configured endpoint,
+    grouped by page_number.
+
+    Args:
+        batch_start: The first page number in this batch
+        pages: List of (page_number, page_text) tuples
+        blob_key: Original S3 key of the book
+        book_id: Book identifier
+        callback_url: URL to POST events to
+        language: Language code for processing
+    """
+    logger.info(f"ParseBatch: Processing batch starting at page {batch_start} ({len(pages)} pages) for book_id={book_id}")
+
+    try:
+        non_empty = [(pn, text) for pn, text in pages if text and len(text.strip()) >= 10]
+
+        if not non_empty:
+            logger.info(f"ParseBatch: All pages in batch {batch_start} are empty, skipping")
+            return {"batch_start": batch_start, "status": "skipped", "events_count": 0}
+
+        cache = await get_page_cache(blob_key, batch_start)
+
+        if cache and cache["status"] == "sent":
+            logger.info(f"ParseBatch: Batch {batch_start} already sent, skipping")
+            return {
+                "batch_start": batch_start,
+                "status": "cached_sent",
+                "events_count": len(cache["events"] or []),
+            }
+
+        combined_text = "\n\n".join(
+            f"--- Страница {pn} ---\n{text}" for pn, text in non_empty
+        )
+
+        if not cache:
+            await save_page_text(blob_key, batch_start, book_id, combined_text)
+
+        if cache and cache["status"] == "events_ready" and cache["events"] is not None:
+            events = cache["events"]
+            logger.info(f"ParseBatch: Using cached events for batch {batch_start}")
+        else:
+            events = await extract_events_from_text(combined_text, language)
+            await save_page_events(blob_key, batch_start, events)
+
+        # Group events by page_number and send one callback per page
+        events_by_page: dict[int, list] = {}
+        for event in events:
+            pn = event.get("page_number", batch_start)
+            events_by_page.setdefault(pn, []).append(event)
+
+        for pn, page_events in events_by_page.items():
+            await send_events_to_endpoint(page_events, book_id, blob_key, pn, callback_url)
+
+        await mark_page_sent(blob_key, batch_start)
+
+        logger.info(f"ParseBatch: Completed batch {batch_start}, found {len(events)} events")
+
+        return {
+            "batch_start": batch_start,
+            "status": "completed",
+            "events_count": len(events),
+            "events": events,
+        }
+
+    except Exception as e:
+        logger.error(f"ParseBatch: Error processing batch {batch_start}: {e}")
+        raise
+
 
 async def parse_page(page_number: int, page_text: str, blob_key: str, book_id: int, callback_url: str, language: str):
     """
@@ -90,7 +164,7 @@ async def parse_page(page_number: int, page_text: str, blob_key: str, book_id: i
 async def get_book_location_events(blob_key: str, book_id: int, callback_url: str, language: str = "en"):
     """
     Async task that processes book location events.
-    Downloads file from S3, divides into pages, and processes each page.
+    Downloads file from S3, divides into pages, and processes them in batches.
 
     Args:
         blob_key: The S3 object key for the book file
@@ -111,24 +185,28 @@ async def get_book_location_events(blob_key: str, book_id: int, callback_url: st
 
         logger.info(f"Processing {len(pages)} pages for blob_key={blob_key}")
 
-        # Step 3: Process each page with ParsePage worker
+        # Step 3: Process pages in batches of BATCH_SIZE
         results = []
-        for page_number, page_text in enumerate(pages, start=1):
+        pages_with_numbers = list(enumerate(pages, start=1))
+
+        for i in range(0, len(pages_with_numbers), BATCH_SIZE):
+            batch = pages_with_numbers[i:i + BATCH_SIZE]
+            batch_start = batch[0][0]
             try:
-                result = await parse_page(
-                    page_number=page_number,
-                    page_text=page_text,
+                result = await parse_batch(
+                    batch_start=batch_start,
+                    pages=batch,
                     blob_key=blob_key,
                     book_id=book_id,
                     callback_url=callback_url,
-                    language=language
+                    language=language,
                 )
                 results.append(result)
             except Exception as e:
-                logger.error(f"Skipping page {page_number} after error: {e}")
-                results.append({"page_number": page_number, "status": "failed", "error": str(e)})
+                logger.error(f"Skipping batch starting at page {batch_start} after error: {e}")
+                results.append({"batch_start": batch_start, "status": "failed", "error": str(e)})
 
-        logger.info(f"Completed 'Get Book Location Events' for book_id={book_id}, processed {len(results)} pages")
+        logger.info(f"Completed 'Get Book Location Events' for book_id={book_id}, processed {len(results)} batches")
 
         return results
 

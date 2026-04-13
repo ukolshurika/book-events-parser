@@ -32,7 +32,7 @@ async def send_events_to_endpoint(events: list[dict], book_id: int, blob_key: st
     mapped_events = [
         {
             "title": event.get("name", ""),
-            "description": event.get("geo") or "",
+            "description": event.get("geo") or event.get("name", ""),
             "date": event.get("date"),
         }
         for event in events

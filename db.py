@@ -14,7 +14,7 @@ _pool: asyncpg.Pool | None = None
 async def _init_connection(conn):
     await conn.set_type_codec(
         "jsonb",
-        encoder=json.dumps,
+        encoder=lambda v: json.dumps(v, ensure_ascii=False),
         decoder=json.loads,
         schema="pg_catalog",
     )
@@ -68,7 +68,7 @@ async def save_page_events(blob_key: str, page_number: int, events: list[dict]):
             """,
             blob_key,
             page_number,
-            json.dumps(events),
+            events,
         )
 
 

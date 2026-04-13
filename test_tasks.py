@@ -3,7 +3,7 @@ from unittest.mock import patch, MagicMock, AsyncMock
 from botocore.exceptions import ClientError
 import io
 
-from tasks import parse_page, get_book_location_events
+from tasks import parse_page, parse_batch, get_book_location_events
 from services.s3 import get_s3_client, download_book_from_s3
 from services.pdf import extract_pages_from_pdf
 from services.yandex_gpt import extract_events_from_text
@@ -17,7 +17,7 @@ from config import (
 
 @pytest.fixture
 def db_mock():
-    """Mocks all DB functions used by parse_page. Default: no cache (None)."""
+    """Mocks all DB functions used by parse_page/parse_batch. Default: no cache (None)."""
     with patch("tasks.get_page_cache", new_callable=AsyncMock) as mock_get, \
          patch("tasks.save_page_text", new_callable=AsyncMock) as mock_save_text, \
          patch("tasks.save_page_events", new_callable=AsyncMock) as mock_save_events, \
@@ -275,21 +275,182 @@ class TestParsePage:
                 )
 
 
+class TestParseBatch:
+    @pytest.mark.asyncio
+    async def test_parse_batch_success(self, db_mock):
+        """Test successful batch processing with no prior cache."""
+        pages = [(1, "Text on page one"), (2, "Text on page two")]
+
+        with patch("tasks.extract_events_from_text", new_callable=AsyncMock) as mock_extract:
+            with patch("tasks.send_events_to_endpoint", new_callable=AsyncMock):
+                mock_extract.return_value = []
+
+                result = await parse_batch(
+                    batch_start=1,
+                    pages=pages,
+                    blob_key="books/test.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
+                    language="en"
+                )
+
+                assert result["batch_start"] == 1
+                assert result["status"] == "completed"
+                assert result["events_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_parse_batch_all_empty_skipped(self, db_mock):
+        """Test that a batch with only empty pages is skipped."""
+        pages = [(1, ""), (2, "   ")]
+
+        result = await parse_batch(
+            batch_start=1,
+            pages=pages,
+            blob_key="books/test.pdf",
+            book_id=123,
+            callback_url="http://example.com/books/123/events",
+            language="en"
+        )
+
+        assert result["status"] == "skipped"
+        assert result["events_count"] == 0
+        db_mock["get_page_cache"].assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_parse_batch_cached_sent_skipped(self, db_mock):
+        """Test that a batch with status 'sent' is skipped."""
+        db_mock["get_page_cache"].return_value = {
+            "status": "sent",
+            "events": [{"name": "Event", "date": "1900", "geo": None, "page_number": 1}],
+        }
+
+        with patch("tasks.extract_events_from_text", new_callable=AsyncMock) as mock_extract:
+            result = await parse_batch(
+                batch_start=1,
+                pages=[(1, "Some content here")],
+                blob_key="books/test.pdf",
+                book_id=123,
+                callback_url="http://example.com/books/123/events",
+                language="en"
+            )
+
+            assert result["status"] == "cached_sent"
+            assert result["events_count"] == 1
+            mock_extract.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_parse_batch_events_grouped_by_page(self, db_mock):
+        """Test that events are sent per page_number via separate callbacks."""
+        pages = [(3, "Page three text here"), (4, "Page four text here")]
+        mock_events = [
+            {"name": "Event A", "date": "1800", "geo": None, "page_number": 3},
+            {"name": "Event B", "date": "1801", "geo": "City", "page_number": 4},
+            {"name": "Event C", "date": "1802", "geo": None, "page_number": 3},
+        ]
+
+        with patch("tasks.extract_events_from_text", new_callable=AsyncMock) as mock_extract:
+            with patch("tasks.send_events_to_endpoint", new_callable=AsyncMock) as mock_send:
+                mock_extract.return_value = mock_events
+
+                result = await parse_batch(
+                    batch_start=3,
+                    pages=pages,
+                    blob_key="books/test.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
+                    language="en"
+                )
+
+                assert result["events_count"] == 3
+                # Two separate callbacks: one for page 3, one for page 4
+                assert mock_send.call_count == 2
+                calls = {call[0][3]: call[0][0] for call in mock_send.call_args_list}
+                assert len(calls[3]) == 2  # page 3: Event A + Event C
+                assert len(calls[4]) == 1  # page 4: Event B
+
+    @pytest.mark.asyncio
+    async def test_parse_batch_combined_text_has_page_markers(self, db_mock):
+        """Test that combined text includes page markers."""
+        pages = [(5, "Text from page five"), (6, "Text from page six")]
+
+        with patch("tasks.extract_events_from_text", new_callable=AsyncMock) as mock_extract:
+            with patch("tasks.send_events_to_endpoint", new_callable=AsyncMock):
+                mock_extract.return_value = []
+
+                await parse_batch(
+                    batch_start=5,
+                    pages=pages,
+                    blob_key="books/test.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
+                    language="ru"
+                )
+
+                called_text = mock_extract.call_args[0][0]
+                assert "--- Страница 5 ---" in called_text
+                assert "--- Страница 6 ---" in called_text
+                assert "Text from page five" in called_text
+                assert "Text from page six" in called_text
+
+    @pytest.mark.asyncio
+    async def test_parse_batch_cached_events_skips_yandex_gpt(self, db_mock):
+        """Test that cached events_ready batch skips YandexGPT call."""
+        cached_events = [{"name": "Cached", "date": "1900", "geo": None, "page_number": 1}]
+        db_mock["get_page_cache"].return_value = {
+            "status": "events_ready",
+            "events": cached_events,
+        }
+
+        with patch("tasks.extract_events_from_text", new_callable=AsyncMock) as mock_extract:
+            with patch("tasks.send_events_to_endpoint", new_callable=AsyncMock):
+                result = await parse_batch(
+                    batch_start=1,
+                    pages=[(1, "Some text content here")],
+                    blob_key="books/test.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
+                    language="en"
+                )
+
+                assert result["status"] == "completed"
+                mock_extract.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_parse_batch_fallback_page_number(self, db_mock):
+        """Test that events without page_number fall back to batch_start."""
+        pages = [(7, "Content of page seven")]
+        mock_events = [{"name": "Event", "date": "1900", "geo": None}]  # no page_number
+
+        with patch("tasks.extract_events_from_text", new_callable=AsyncMock) as mock_extract:
+            with patch("tasks.send_events_to_endpoint", new_callable=AsyncMock) as mock_send:
+                mock_extract.return_value = mock_events
+
+                await parse_batch(
+                    batch_start=7,
+                    pages=pages,
+                    blob_key="books/test.pdf",
+                    book_id=123,
+                    callback_url="http://example.com/books/123/events",
+                    language="en"
+                )
+
+                # Should be sent with page_number=7 (batch_start fallback)
+                mock_send.assert_called_once()
+                assert mock_send.call_args[0][3] == 7
+
+
 class TestGetBookLocationEvents:
     @pytest.mark.asyncio
     async def test_full_flow_success(self):
-        """Test the complete book processing flow."""
-        mock_pdf_content = b"fake pdf content"
+        """Test the complete book processing flow with batching."""
         mock_pages = ["Page 1 text", "Page 2 text", "Page 3 text"]
 
-        with patch("tasks.download_book_from_s3", return_value=mock_pdf_content) as mock_download:
+        with patch("tasks.download_book_from_s3", return_value=b"fake pdf content") as mock_download:
             with patch("tasks.extract_pages_from_pdf", return_value=mock_pages):
-                with patch("tasks.parse_page", new_callable=AsyncMock) as mock_parse:
-                    mock_parse.side_effect = [
-                        {"page_number": 1, "status": "completed", "char_count": 11, "events_count": 0, "events": []},
-                        {"page_number": 2, "status": "completed", "char_count": 11, "events_count": 0, "events": []},
-                        {"page_number": 3, "status": "completed", "char_count": 11, "events_count": 0, "events": []},
-                    ]
+                with patch("tasks.parse_batch", new_callable=AsyncMock) as mock_parse:
+                    mock_parse.return_value = {
+                        "batch_start": 1, "status": "completed", "events_count": 0, "events": []
+                    }
 
                     results = await get_book_location_events(
                         blob_key="books/test.pdf",
@@ -299,19 +460,52 @@ class TestGetBookLocationEvents:
                     )
 
                     mock_download.assert_called_once_with("books/test.pdf")
-                    assert mock_parse.call_count == 3
-                    assert len(results) == 3
-                    assert results[0]["page_number"] == 1
-                    assert results[1]["page_number"] == 2
-                    assert results[2]["page_number"] == 3
+                    # 3 pages → 1 batch
+                    assert mock_parse.call_count == 1
+                    assert len(results) == 1
+                    assert results[0]["batch_start"] == 1
 
     @pytest.mark.asyncio
-    async def test_passes_language_to_parse_page(self):
-        """Test that language is passed correctly to parse_page."""
+    async def test_multiple_batches(self):
+        """Test that 11 pages produce 2 batches (10 + 1)."""
+        mock_pages = [f"Page {i} text" for i in range(1, 12)]
+
+        with patch("tasks.download_book_from_s3", return_value=b"pdf"):
+            with patch("tasks.extract_pages_from_pdf", return_value=mock_pages):
+                with patch("tasks.parse_batch", new_callable=AsyncMock) as mock_parse:
+                    mock_parse.side_effect = [
+                        {"batch_start": 1, "status": "completed", "events_count": 0, "events": []},
+                        {"batch_start": 11, "status": "completed", "events_count": 0, "events": []},
+                    ]
+
+                    results = await get_book_location_events(
+                        blob_key="books/test.pdf",
+                        book_id=123,
+                        callback_url="http://example.com/books/123/events",
+                        language="en"
+                    )
+
+                    assert mock_parse.call_count == 2
+                    assert results[0]["batch_start"] == 1
+                    assert results[1]["batch_start"] == 11
+
+                    # First batch has pages 1-10
+                    first_call = mock_parse.call_args_list[0][1]
+                    assert first_call["batch_start"] == 1
+                    assert len(first_call["pages"]) == 10
+
+                    # Second batch has page 11
+                    second_call = mock_parse.call_args_list[1][1]
+                    assert second_call["batch_start"] == 11
+                    assert len(second_call["pages"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_passes_language_to_parse_batch(self):
+        """Test that language is passed correctly to parse_batch."""
         with patch("tasks.download_book_from_s3", return_value=b"pdf"):
             with patch("tasks.extract_pages_from_pdf", return_value=["Page content"]):
-                with patch("tasks.parse_page", new_callable=AsyncMock) as mock_parse:
-                    mock_parse.return_value = {"page_number": 1, "status": "completed", "char_count": 12, "events_count": 0, "events": []}
+                with patch("tasks.parse_batch", new_callable=AsyncMock) as mock_parse:
+                    mock_parse.return_value = {"batch_start": 1, "status": "completed", "events_count": 0, "events": []}
 
                     await get_book_location_events(
                         blob_key="books/french.pdf",
@@ -320,22 +514,18 @@ class TestGetBookLocationEvents:
                         language="fr"
                     )
 
-                    mock_parse.assert_called_once_with(
-                        page_number=1,
-                        page_text="Page content",
-                        blob_key="books/french.pdf",
-                        book_id=789,
-                        callback_url="http://example.com/books/789/events",
-                        language="fr"
-                    )
+                    call_kwargs = mock_parse.call_args[1]
+                    assert call_kwargs["language"] == "fr"
+                    assert call_kwargs["batch_start"] == 1
+                    assert call_kwargs["pages"] == [(1, "Page content")]
 
     @pytest.mark.asyncio
     async def test_default_language(self):
         """Test that default language 'en' is used when not specified."""
         with patch("tasks.download_book_from_s3", return_value=b"pdf"):
             with patch("tasks.extract_pages_from_pdf", return_value=["Content"]):
-                with patch("tasks.parse_page", new_callable=AsyncMock) as mock_parse:
-                    mock_parse.return_value = {"page_number": 1, "status": "completed", "char_count": 7, "events_count": 0, "events": []}
+                with patch("tasks.parse_batch", new_callable=AsyncMock) as mock_parse:
+                    mock_parse.return_value = {"batch_start": 1, "status": "completed", "events_count": 0, "events": []}
 
                     await get_book_location_events(
                         blob_key="books/test.pdf",
@@ -378,14 +568,16 @@ class TestGetBookLocationEvents:
                 assert results == []
 
     @pytest.mark.asyncio
-    async def test_parse_page_error_recorded_in_results(self):
-        """Test that parse_page errors are recorded as 'failed' and do not abort the book."""
+    async def test_parse_batch_error_recorded_in_results(self):
+        """Test that parse_batch errors are recorded as 'failed' and do not abort the book."""
+        mock_pages = [f"Page {i} text" for i in range(1, 12)]  # 11 pages = 2 batches
+
         with patch("tasks.download_book_from_s3", return_value=b"pdf"):
-            with patch("tasks.extract_pages_from_pdf", return_value=["Page 1", "Page 2"]):
-                with patch("tasks.parse_page", new_callable=AsyncMock) as mock_parse:
+            with patch("tasks.extract_pages_from_pdf", return_value=mock_pages):
+                with patch("tasks.parse_batch", new_callable=AsyncMock) as mock_parse:
                     mock_parse.side_effect = [
-                        Exception("Processing failed"),
-                        {"page_number": 2, "status": "completed", "char_count": 6, "events_count": 0, "events": []},
+                        Exception("Batch processing failed"),
+                        {"batch_start": 11, "status": "completed", "events_count": 0, "events": []},
                     ]
 
                     results = await get_book_location_events(
@@ -397,7 +589,7 @@ class TestGetBookLocationEvents:
 
                     assert len(results) == 2
                     assert results[0]["status"] == "failed"
-                    assert results[0]["error"] == "Processing failed"
+                    assert results[0]["error"] == "Batch processing failed"
                     assert results[1]["status"] == "completed"
 
 
@@ -437,7 +629,7 @@ class TestExtractEventsFromText:
                 "alternatives": [
                     {
                         "message": {
-                            "text": '[{"name": "Battle of Waterloo", "date": "1815-06-18", "geo": "Waterloo, Belgium"}]'
+                            "text": '[{"name": "Battle of Waterloo", "date": "1815-06-18", "geo": "Waterloo, Belgium", "page_number": 3}]'
                         }
                     }
                 ]
@@ -456,6 +648,7 @@ class TestExtractEventsFromText:
                 assert events[0]["name"] == "Battle of Waterloo"
                 assert events[0]["date"] == "1815-06-18"
                 assert events[0]["geo"] == "Waterloo, Belgium"
+                assert events[0]["page_number"] == 3
 
     @pytest.mark.asyncio
     async def test_extract_events_no_credentials(self):
@@ -499,7 +692,7 @@ class TestExtractEventsFromText:
                 "alternatives": [
                     {
                         "message": {
-                            "text": '[{"name": "Signing of Declaration", "date": "1776-07-04", "geo": null}]'
+                            "text": '[{"name": "Signing of Declaration", "date": "1776-07-04", "geo": null, "page_number": 1}]'
                         }
                     }
                 ]
