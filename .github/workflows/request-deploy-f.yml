@@ -1,0 +1,22 @@
+name: Request deploy-f package build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - deploy
+  workflow_dispatch:
+
+jobs:
+  request-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger website deploy workflow
+        run: |
+          curl -fsS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.DEPLOY_DISPATCH_TOKEN }}" \
+            https://api.github.com/repos/ukolshurika/history-prism/dispatches \
+            -d '{"event_type":"deploy-f","client_payload":{"source_repo":"book-events-parser","source_sha":"${{ github.sha }}"}}'

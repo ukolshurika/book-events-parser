@@ -1,0 +1,18 @@
+config_version = "0"
+
+exclude_patterns = [
+  ".pytest_cache/**",
+  "**/__pycache__/**"
+]
+
+test_patterns = [
+  "test_*.py",
+  "**/test_*.py"
+]
+
+[[source]]
+name = "default"
+default = true
+
+[[plugin]]
+name = "ruff"
