@@ -8,6 +8,8 @@ from db import get_page_cache, save_page_text, save_page_events, mark_page_sent
 from services import (
     download_book_from_s3,
     extract_pages_from_pdf,
+    extract_pages_from_epub,
+    extract_pages_from_txt,
     extract_events_from_text,
     send_events_to_endpoint,
 )
@@ -161,7 +163,29 @@ async def parse_page(page_number: int, page_text: str, blob_key: str, book_id: i
         raise
 
 
-async def get_book_location_events(blob_key: str, book_id: int, callback_url: str, language: str = "en"):
+def _detect_file_type(blob_key: str, file_type: str | None = None) -> str:
+    """
+    Detects file type from blob_key extension or explicit file_type parameter.
+
+    Args:
+        blob_key: The S3 object key for the book file
+        file_type: Optional explicit file type override
+
+    Returns:
+        One of: "pdf", "epub", "txt"
+    """
+    if file_type and file_type in ("pdf", "epub", "txt"):
+        return file_type
+
+    lower_key = blob_key.lower()
+    if lower_key.endswith(".epub"):
+        return "epub"
+    if lower_key.endswith(".txt"):
+        return "txt"
+    return "pdf"
+
+
+async def get_book_location_events(blob_key: str, book_id: int, callback_url: str, language: str = "en", file_type: str | None = None):
     """
     Async task that processes book location events.
     Downloads file from S3, divides into pages, and processes them in batches.
@@ -171,17 +195,26 @@ async def get_book_location_events(blob_key: str, book_id: int, callback_url: st
         book_id: Book identifier
         callback_url: URL to POST events to
         language: Language code for processing (default: "en")
+        file_type: Optional file type ("pdf", "epub", "txt"). Auto-detected from blob_key if not provided.
     """
-    logger.info(f"Starting 'Get Book Location Events' for book_id={book_id}, blob_key={blob_key}, language={language}")
+    detected_type = _detect_file_type(blob_key, file_type)
+    logger.info(f"Starting 'Get Book Location Events' for book_id={book_id}, blob_key={blob_key}, language={language}, file_type={detected_type}")
 
     try:
         # Step 1: Download book from S3
         file_content = download_book_from_s3(blob_key)
 
-        # Step 2: Divide book into pages (with OCR support for image-based PDFs)
-        # Run in thread pool to avoid blocking the async event loop during OCR
+        # Step 2: Divide book into pages based on file type
         loop = asyncio.get_event_loop()
-        pages = await loop.run_in_executor(None, partial(extract_pages_from_pdf, file_content, language))
+
+        if detected_type == "pdf":
+            pages = await loop.run_in_executor(None, partial(extract_pages_from_pdf, file_content, language))
+        elif detected_type == "epub":
+            pages = extract_pages_from_epub(file_content)
+        elif detected_type == "txt":
+            pages = extract_pages_from_txt(file_content)
+        else:
+            pages = []
 
         logger.info(f"Processing {len(pages)} pages for blob_key={blob_key}")
 

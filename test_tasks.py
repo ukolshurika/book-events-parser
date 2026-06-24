@@ -3,9 +3,11 @@ from unittest.mock import patch, MagicMock, AsyncMock
 from botocore.exceptions import ClientError
 import io
 
-from tasks import parse_page, parse_batch, get_book_location_events
+from tasks import parse_page, parse_batch, get_book_location_events, _detect_file_type
 from services.s3 import get_s3_client, download_book_from_s3
 from services.pdf import extract_pages_from_pdf
+from services.epub import extract_pages_from_epub
+from services.txt import extract_pages_from_txt
 from services.yandex_gpt import extract_events_from_text
 from services.events import send_events_to_endpoint
 from config import (
@@ -807,3 +809,176 @@ class TestParsePageWithYandexGPT:
                 assert result["events_count"] == 0
                 assert result["events"] == []
                 mock_send.assert_not_called()
+
+
+class TestExtractPagesFromTxt:
+    def test_extracts_single_page(self):
+        pages = extract_pages_from_txt(b"Just a single page of text")
+        assert len(pages) == 1
+        assert pages[0] == "Just a single page of text"
+
+    def test_splits_by_form_feed(self):
+        content = b"Page one content\fPage two content\fPage three content"
+        pages = extract_pages_from_txt(content)
+        assert len(pages) == 3
+        assert pages[0] == "Page one content"
+        assert pages[1] == "Page two content"
+        assert pages[2] == "Page three content"
+
+    def test_skips_empty_pages(self):
+        content = b"Page one\f\f\fPage two"
+        pages = extract_pages_from_txt(content)
+        assert len(pages) == 2
+        assert pages[0] == "Page one"
+        assert pages[1] == "Page two"
+
+    def test_handles_utf8_content(self):
+        content = "Страница с русским текстом".encode("utf-8")
+        pages = extract_pages_from_txt(content)
+        assert len(pages) == 1
+        assert pages[0] == "Страница с русским текстом"
+
+    def test_empty_file_returns_empty_list(self):
+        pages = extract_pages_from_txt(b"")
+        assert pages == []
+
+
+class TestExtractPagesFromEpub:
+    def test_extracts_sections_from_epub(self):
+        from ebooklib import epub as epub_lib
+
+        book = epub_lib.EpubBook()
+        book.set_identifier("test")
+        book.set_title("Test")
+        book.set_language("en")
+
+        c1 = epub_lib.EpubHtml(title="Chapter 1", file_name="chap_01.xhtml")
+        c1.content = "<html><body><p>First chapter text</p></body></html>".encode("utf-8")
+        book.add_item(c1)
+
+        c2 = epub_lib.EpubHtml(title="Chapter 2", file_name="chap_02.xhtml")
+        c2.content = "<html><body><p>Second chapter content</p></body></html>".encode("utf-8")
+        book.add_item(c2)
+
+        c3 = epub_lib.EpubHtml(title="Chapter 3", file_name="chap_03.xhtml")
+        c3.content = "<html><body><h1>Third</h1><p>chapter</p></body></html>".encode("utf-8")
+        book.add_item(c3)
+
+        spine = ["nav", c1, c2, c3]
+        book.toc = [c1, c2, c3]
+        book.spine = spine
+        book.add_item(epub_lib.EpubNcx())
+        book.add_item(epub_lib.EpubNav())
+
+        buf = io.BytesIO()
+        epub_lib.write_epub(buf, book)
+        file_content = buf.getvalue()
+
+        pages = extract_pages_from_epub(file_content)
+        assert len(pages) == 3
+        assert pages[0] == "First chapter text"
+        assert pages[1] == "Second chapter content"
+        assert pages[2] == "Third chapter"
+
+    def test_empty_epub_returns_empty_list(self):
+        from ebooklib import epub as epub_lib
+
+        book = epub_lib.EpubBook()
+        book.set_identifier("test")
+        book.set_title("Empty")
+
+        buf = io.BytesIO()
+        epub_lib.write_epub(buf, book)
+        file_content = buf.getvalue()
+
+        pages = extract_pages_from_epub(file_content)
+        assert pages == []
+
+
+class TestDetectFileType:
+    def test_detects_pdf_from_blob_key(self):
+        assert _detect_file_type("books/test.pdf") == "pdf"
+        assert _detect_file_type("books/doc.PDF") == "pdf"
+
+    def test_detects_epub_from_blob_key(self):
+        assert _detect_file_type("books/book.epub") == "epub"
+        assert _detect_file_type("books/novel.EPUB") == "epub"
+
+    def test_detects_txt_from_blob_key(self):
+        assert _detect_file_type("books/notes.txt") == "txt"
+        assert _detect_file_type("books/readme.TXT") == "txt"
+
+    def test_defaults_to_pdf_for_unknown_extensions(self):
+        assert _detect_file_type("books/file.docx") == "pdf"
+        assert _detect_file_type("books/file") == "pdf"
+
+    def test_explicit_file_type_overrides_blob_key(self):
+        assert _detect_file_type("books/test.pdf", "epub") == "epub"
+        assert _detect_file_type("books/strange.file", "txt") == "txt"
+
+    def test_explicit_file_type_defaults_to_pdf_if_unknown(self):
+        assert _detect_file_type("books/test.epub", "unknown") == "epub"
+        assert _detect_file_type("books/test.txt", "") == "txt"
+
+
+class TestGetBookLocationEventsRouting:
+    @pytest.mark.asyncio
+    async def test_routes_to_pdf_extractor_for_pdf(self):
+        with patch("tasks.download_book_from_s3", return_value=b"fake"):
+            with patch("tasks.extract_pages_from_pdf", return_value=["page text"]):
+                with patch("tasks.parse_batch", new_callable=AsyncMock) as mock_parse:
+                    mock_parse.return_value = {"batch_start": 1, "status": "completed", "events_count": 0, "events": []}
+
+                    await get_book_location_events(
+                        blob_key="books/test.pdf",
+                        book_id=123,
+                        callback_url="http://example.com/books/123/events"
+                    )
+
+                    assert mock_parse.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_routes_to_epub_extractor_for_epub(self):
+        with patch("tasks.download_book_from_s3", return_value=b"fake"):
+            with patch("tasks.extract_pages_from_epub", return_value=["chapter text"]):
+                with patch("tasks.parse_batch", new_callable=AsyncMock) as mock_parse:
+                    mock_parse.return_value = {"batch_start": 1, "status": "completed", "events_count": 0, "events": []}
+
+                    await get_book_location_events(
+                        blob_key="books/book.epub",
+                        book_id=456,
+                        callback_url="http://example.com/books/456/events"
+                    )
+
+                    assert mock_parse.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_routes_to_txt_extractor_for_txt(self):
+        with patch("tasks.download_book_from_s3", return_value=b"fake"):
+            with patch("tasks.extract_pages_from_txt", return_value=["text"]):
+                with patch("tasks.parse_batch", new_callable=AsyncMock) as mock_parse:
+                    mock_parse.return_value = {"batch_start": 1, "status": "completed", "events_count": 0, "events": []}
+
+                    await get_book_location_events(
+                        blob_key="books/notes.txt",
+                        book_id=789,
+                        callback_url="http://example.com/books/789/events"
+                    )
+
+                    assert mock_parse.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_explicit_file_type_overrides_extension(self):
+        with patch("tasks.download_book_from_s3", return_value=b"fake"):
+            with patch("tasks.extract_pages_from_epub", return_value=["text"]):
+                with patch("tasks.parse_batch", new_callable=AsyncMock) as mock_parse:
+                    mock_parse.return_value = {"batch_start": 1, "status": "completed", "events_count": 0, "events": []}
+
+                    await get_book_location_events(
+                        blob_key="books/strange.bin",
+                        book_id=123,
+                        callback_url="http://example.com/books/123/events",
+                        file_type="epub"
+                    )
+
+                    assert mock_parse.call_count == 1
