@@ -49,18 +49,21 @@ class BookRequest(BaseModel):
     book_id: int
     callback_url: str
     language: str = "en"
+    file_type: str | None = None
 
 
 @app.post("/book")
 async def create_book(request: BookRequest, background_tasks: BackgroundTasks):
     """
     Receives blob_key, book_id, and callback_url, then triggers async task to get book location events.
+    file_type is optional — auto-detected from blob_key extension if not provided.
     """
     background_tasks.add_task(
         get_book_location_events,
         request.blob_key,
         request.book_id,
         request.callback_url,
-        request.language
+        request.language,
+        request.file_type
     )
     return {"status": "OK"}
